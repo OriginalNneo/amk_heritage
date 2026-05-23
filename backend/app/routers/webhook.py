@@ -140,15 +140,15 @@ def _build_approval_keyboard(review_id: str, checkpoint_buttons: list[tuple] = N
 
 def _build_checkpoint_keyboard(review_id: str, checkpoint_buttons: list[tuple]) -> dict:
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    rows = []
+    rows = [[InlineKeyboardButton(
+        text="Start", callback_data=f"assign_{review_id}_0"
+    )]]
     for cp_id, cp_name in checkpoint_buttons:
         short_name = cp_name[:30]
         rows.append(InlineKeyboardButton(
             text=short_name, callback_data=f"assign_{review_id}_{cp_id}"
         ))
-    for i in range(0, len(rows), 2):
-        pass
-    chunked = [rows[i:i+2] for i in range(0, len(rows), 2)]
+    chunked = [rows[0]] + [rows[i:i+2] for i in range(1, len(rows))]
     keyboard = InlineKeyboardMarkup(inline_keyboard=chunked)
     return keyboard
 
@@ -158,11 +158,13 @@ async def handle_telegram_webhook(request: Request):
     payload = await request.json()
 
     if "callback_query" in payload:
-        logger.info(f"GOT CALLBACK: {payload['callback_query'].get('data','')}")
-        try:
-            await _handle_callback(payload["callback_query"])
-        except Exception as e:
-            logger.error(f"Callback error: {e}", exc_info=True)
+        cq = payload["callback_query"]
+        if cq:
+            logger.info(f"GOT CALLBACK: {cq.get('data','')}")
+            try:
+                await _handle_callback(cq)
+            except Exception as e:
+                logger.error(f"Callback error: {e}", exc_info=True)
         return {"status": "ok"}
 
     message_data = payload.get("edited_message") or payload.get("message")
@@ -234,7 +236,8 @@ async def _handle_callback(callback_query: dict):
 
     callback_data = callback_query.get("data", "")
     callback_id = callback_query.get("id", "")
-    from_chat_id = callback_query.get("message", {}).get("chat", {}).get("id")
+    msg = callback_query.get("message") or {}
+    from_chat_id = msg.get("chat", {}).get("id")
 
     logger.info(f"CALLBACK data={callback_data} from_chat={from_chat_id} hq={HQ_CHAT_ID}")
 
@@ -339,6 +342,20 @@ async def _handle_hq_approved(review: dict, bot):
                 "chat_id": chat_id, "team_name": team_name,
                 "checkpoint_name": "Approved submission",
             })
+            return
+
+        if checkpoint_id == 0:
+            from app.models import Team, RaceStatus
+            team_result = await db.execute(select(Team).where(Team.chat_id == chat_id))
+            team = team_result.scalar_one_or_none()
+            if team:
+                team.status = RaceStatus.IN_PROGRESS.value
+            await db.commit()
+            await bus.publish_event("checkpoint_unlocked", {
+                "chat_id": chat_id, "team_name": team_name,
+                "checkpoint_name": "Start",
+            })
+            await send_message(chat_id, "Your submission has been approved! The race has begun!\n\nHead to the first checkpoint!")
             return
 
         cp_result = await db.execute(

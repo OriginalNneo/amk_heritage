@@ -812,17 +812,14 @@
       gallery.innerHTML = '<div class="team-gallery"><div class="skeleton-gallery">' + Array.from({length: 6}, () => '<div class="skeleton-gallery-card"><div class="skeleton skeleton-img"></div><div class="skeleton-body"><div class="skeleton skeleton-line w-75"></div><div class="skeleton skeleton-line w-50"></div><div class="skeleton skeleton-line w-100"></div></div></div>').join('') + '</div></div>';
 
       try {
-        const res = await fetch(`${API_BASE}/admin/teams/${team.chatId}/submissions`);
+        const res = await fetch(`${API_BASE}/admin/teams/${team.chatId}/gdrive-images`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const progressRes = await fetch(`${API_BASE}/admin/progress/all`);
-        if (!progressRes.ok) throw new Error(`HTTP ${progressRes.status}`);
-        const allProgress = await progressRes.json();
-        const teamProgress = allProgress.find(t => t.chat_id === team.chatId) || {};
 
-        const completedSet = new Set(teamProgress.completed_checkpoints || []);
+        const completedSet = new Set(data.completed_checkpoints || []);
         const completed = completedSet.size;
-        const score = teamProgress.score || 0;
+        const score = data.score || 0;
+        const totalCheckpoints = data.total_checkpoints || TOTAL_CHECKPOINTS;
 
         const backBtn = `<button class="gallery-back-btn" onclick="switchTab('All')"><svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>Back to Dashboard</button>`;
 
@@ -831,12 +828,12 @@
           return;
         }
 
-        console.log('Team gallery submissions:', data.submissions.length, data.submissions.map(s => s.sub_id));
+        console.log('Team gallery submissions (GDrive):', data.submissions.length, data.submissions.map(s => s.filename));
         lightboxPhotos = [];
         let html = `${backBtn}<div class="team-gallery-header">
           <h2>${data.team_name}</h2>
           <div class="stats">
-            <div class="stat"><div class="label">Checkpoints</div><div class="value">${completed} / ${TOTAL_CHECKPOINTS}</div></div>
+            <div class="stat"><div class="label">Checkpoints</div><div class="value">${completed} / ${totalCheckpoints}</div></div>
             <div class="stat"><div class="label">Score</div><div class="value">${score}</div></div>
             <div class="stat"><div class="label">Photos</div><div class="value">${data.submissions.length}</div></div>
           </div>
@@ -845,25 +842,28 @@
 
         data.submissions.forEach((s, idx) => {
           const timeStr = s.timestamp ? new Date(s.timestamp).toLocaleString('en-SG', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit', second:'2-digit' }) : 'N/A';
-          const isCompleted = completedSet.has(s.checkpoint_order);
-          const imgSrc = `${API_BASE}/admin/submissions/${s.sub_id}/image?t=${Date.now()}`;
+          const isVideo = s.is_video || false;
+          const imgSrc = `${API_BASE}/admin/gdrive-image/${s.gdrive_id}?t=${Date.now()}`;
+          const label = s.filename.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
           console.log('Gallery image URL:', imgSrc);
-          lightboxPhotos.push({ imgSrc, cpName: `CP${s.checkpoint_order}: ${s.checkpoint_name}`, taskDesc: s.task_description, timeStr, completed: isCompleted });
+          lightboxPhotos.push({ imgSrc, cpName: label, taskDesc: '', timeStr, completed: true, isVideo });
           html += `<div class="gallery-card">
             <div class="card-img-wrap" onclick="openLightbox(${idx})">
-              <img class="card-img" src="${imgSrc}" onerror="console.error('Image failed:', this.src)">
+              ${isVideo
+                ? `<video class="card-img" src="${imgSrc}" onerror="console.error('Video failed:', this.src)" muted></video>`
+                : `<img class="card-img" src="${imgSrc}" onerror="console.error('Image failed:', this.src)">`}
               <div class="card-img-gradient"></div>
-              <div class="cp-status-badge ${isCompleted ? 'completed' : 'uncompleted'}">${isCompleted ? '✓ Completed' : 'Pending'}</div>
+              ${isVideo
+                ? '<div class="cp-status-badge video-badge">Video</div>'
+                : '<div class="cp-status-badge completed">Uploaded</div>'}
               <div class="card-hover-overlay">
                 <div class="magnify-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></div>
               </div>
             </div>
             <div class="card-body">
-              <div class="card-cp">CP${s.checkpoint_order}: ${s.checkpoint_name}</div>
-              <div class="card-task">${s.task_description || ''}</div>
+              <div class="card-cp">${label}</div>
               <div class="card-meta">
                 <div class="card-time">🕐 ${timeStr}</div>
-                <span class="card-badge">#${s.checkpoint_order}</span>
               </div>
             </div>
           </div>`;
@@ -873,6 +873,7 @@
         gallery.innerHTML = html;
         console.log('Gallery innerHTML set, length:', gallery.innerHTML.length, 'children:', gallery.children.length, 'teamView display:', document.getElementById('teamView').style.display, 'teamView visible:', document.getElementById('teamView').classList.contains('visible'));
       } catch (err) {
+        console.error('loadTeamGallery error:', err);
         gallery.innerHTML = `<div class="no-submissions"><div class="icon">⚠️</div><p>Failed to load data.</p></div>`;
       }
     }

@@ -1,10 +1,12 @@
 import logging
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
 
 from app.database import get_db
 from app.models import Team, Checkpoint, Submission, LiveTelemetry, RaceStatus
@@ -362,3 +364,170 @@ async def get_submission_image(sub_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Image file not found")
 
     return FileResponse(str(img_file))
+
+
+def _get_gdrive_service():
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from app.config import get_settings
+
+    s = get_settings()
+    creds = Credentials.from_authorized_user_info(
+        {
+            "client_id": s.gdrive_client_id,
+            "client_secret": s.gdrive_client_secret,
+            "refresh_token": s.gdrive_refresh_token,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/drive"],
+        },
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False), s
+
+
+_IMAGE_MIME_PREFIX = ("image/", "video/")
+
+
+@router.get("/teams/{chat_id}/gdrive-images")
+async def get_team_gdrive_images(chat_id: int, db: AsyncSession = Depends(get_db)):
+    team_result = await db.execute(select(Team).where(Team.chat_id == chat_id))
+    team = team_result.scalar_one_or_none()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    drive, settings = _get_gdrive_service()
+    folder_id = settings.gdrive_folder_id
+    if not folder_id:
+        raise HTTPException(status_code=503, detail="Google Drive not configured")
+
+    team_prefix = team.team_name.replace(" ", "_") + "_"
+
+    all_files = []
+    page_token = None
+    while True:
+        results = drive.files().list(
+            q=f"'{folder_id}' in parents",
+            fields="files(id, name, mimeType, createdTime), nextPageToken",
+            pageSize=100,
+            pageToken=page_token,
+            orderBy="createdTime desc",
+        ).execute()
+        all_files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    matching_files = []
+
+    for f in all_files:
+        if not any(f["mimeType"].startswith(p) for p in _IMAGE_MIME_PREFIX):
+            continue
+        fname = f["name"]
+        stem = fname.rsplit(".", 1)[0]
+        if stem.lower().startswith(team_prefix.lower()):
+            matching_files.append(f)
+
+    subfolders = [f for f in all_files if f["mimeType"] == "application/vnd.google-apps.folder"]
+    for sf in subfolders:
+        if sf["name"].lower() != team.team_name.lower():
+            continue
+        page_token = None
+        while True:
+            sub_results = drive.files().list(
+                q=f"'{sf['id']}' in parents",
+                fields="files(id, name, mimeType, createdTime), nextPageToken",
+                pageSize=100,
+                pageToken=page_token,
+                orderBy="createdTime desc",
+            ).execute()
+            for f in sub_results.get("files", []):
+                if any(f["mimeType"].startswith(p) for p in _IMAGE_MIME_PREFIX):
+                    matching_files.append(f)
+            page_token = sub_results.get("nextPageToken")
+            if not page_token:
+                break
+
+    cp_result = await db.execute(select(Checkpoint).order_by(Checkpoint.order_index))
+    all_checkpoints = cp_result.scalars().all()
+
+    completed = await db.execute(
+        select(Submission.checkpoint_id).where(
+            Submission.team_id == chat_id,
+            Submission.status == "correct",
+        )
+    )
+    completed_set = {row[0] for row in completed.all()}
+
+    submissions_list = []
+    for f in matching_files:
+        ts_str = f.get("createdTime", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except Exception:
+            ts = None
+        submissions_list.append({
+            "gdrive_id": f["id"],
+            "filename": f["name"],
+            "timestamp": ts.isoformat() if ts else None,
+            "mimeType": f["mimeType"],
+            "is_video": f["mimeType"].startswith("video/"),
+        })
+
+    return {
+        "chat_id": chat_id,
+        "team_name": team.team_name,
+        "submissions": submissions_list,
+        "completed_checkpoints": list(completed_set),
+        "total_checkpoints": len(all_checkpoints),
+        "score": team.score,
+    }
+
+
+@router.get("/gdrive-image/{file_id}")
+async def proxy_gdrive_image(file_id: str):
+    drive, settings = _get_gdrive_service()
+
+    file_meta = drive.files().get(
+        fileId=file_id,
+        fields="id, name, mimeType",
+    ).execute()
+
+    mime = file_meta.get("mimeType", "application/octet-stream")
+    is_video = mime.startswith("video/")
+
+    if is_video:
+        request = drive.files().get_media(fileId=file_id)
+        import io
+        from googleapiclient.http import MediaIoBaseDownload
+
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+
+        return StreamingResponse(
+            fh,
+            media_type=mime,
+            headers={"Content-Disposition": f'inline; filename="{file_meta["name"]}"'},
+        )
+
+    import io
+    from googleapiclient.http import MediaIoBaseDownload
+
+    fh = io.BytesIO()
+    request = drive.files().get_media(fileId=file_id)
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+
+    return StreamingResponse(
+        fh,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'inline; filename="{file_meta["name"]}"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )

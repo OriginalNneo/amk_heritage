@@ -210,6 +210,10 @@ async def advance_team_by_checkpoint(
     remaining_cps = [c for c in all_cps if c.checkpoint_id not in completed_ids]
     next_cp = remaining_cps[0] if remaining_cps else None
 
+    team.current_checkpoint_id = next_cp.checkpoint_id if next_cp else None
+    if team.status != RaceStatus.IN_PROGRESS.value:
+        team.status = RaceStatus.IN_PROGRESS.value
+
     return {
         "action": "advanced",
         "team_name": team.team_name,

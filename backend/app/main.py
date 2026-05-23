@@ -27,15 +27,47 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    import asyncio
     from app.services.telegram_service import bot
+
+    polling_task = None
     try:
         if settings.telegram_webhook_url:
             await bot.set_webhook(settings.telegram_webhook_url)
             logger.info(f"Telegram webhook set to {settings.telegram_webhook_url}")
+        else:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook cleared — starting polling mode")
+
+            from httpx import AsyncClient, ASGITransport
+
+            async def _poll():
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://localhost") as client:
+                    offset = 0
+                    while True:
+                        try:
+                            updates = await bot.get_updates(
+                                offset=offset, timeout=30,
+                                allowed_updates=["message", "callback_query"],
+                            )
+                            for update in updates:
+                                offset = update.update_id + 1
+                                await client.post("/webhook/telegram", json=update.model_dump(exclude_none=True, mode="json"))
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            logger.error(f"Polling error: {e}")
+                            await asyncio.sleep(3)
+
+            polling_task = asyncio.create_task(_poll())
     except Exception as e:
-        logger.warning(f"Could not set webhook: {e}")
+        logger.warning(f"Could not start bot: {e}")
 
     yield
+
+    if polling_task:
+        polling_task.cancel()
 
     from app.services.telegram_service import bot
     try:
